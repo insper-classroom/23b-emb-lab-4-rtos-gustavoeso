@@ -1,6 +1,13 @@
 #include "conf_board.h"
 #include <asf.h>
 
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
+#include "timers.h"
+#include "semphr.h"
+
+
 /************************************************************************/
 /* BOARD CONFIG                                                         */
 /************************************************************************/
@@ -19,6 +26,12 @@
 #define TASK_ADC_STACK_SIZE (1024 * 10 / sizeof(portSTACK_TYPE))
 #define TASK_ADC_STACK_PRIORITY (tskIDLE_PRIORITY)
 
+#define TASK_PROC_STACK_SIZE (1024 * 10 / sizeof(portSTACK_TYPE))
+#define TASK_PROC_STACK_PRIORITY (tskIDLE_PRIORITY)
+
+#define N 10
+
+
 extern void vApplicationStackOverflowHook(xTaskHandle *pxTask,
                                           signed char *pcTaskName);
 extern void vApplicationIdleHook(void);
@@ -35,9 +48,13 @@ TimerHandle_t xTimer;
 /** Queue for msg log send data */
 QueueHandle_t xQueueADC;
 
+QueueHandle_t xQueuePROC;
+
 typedef struct {
   uint value;
 } adcData;
+
+SemaphoreHandle_t xSemaphore;
 
 /************************************************************************/
 /* prototypes local                                                     */
@@ -98,6 +115,46 @@ void vTimerCallback(TimerHandle_t xTimer) {
   afec_start_software_conversion(AFEC_POT);
 }
 
+#define N 10 // Número de pontos na média móvel
+
+static void task_proc(void *pvParameters) {
+  adcData adc;
+
+  int adcValues[N];
+  int sum = 0; // Soma dos valores atuais na média móvel
+
+  for (int i = 0; i < N; i++) {
+    // Inicialize a matriz com valores iniciais
+    if (xQueueReceive(xQueueADC, &adc, portMAX_DELAY) == pdTRUE) {
+      adcValues[i] = adc.value;
+      sum += adc.value;
+    }
+  }
+
+  for (;;) {
+    if (xQueueReceive(xQueueADC, &adc, portMAX_DELAY) == pdTRUE) {
+      // Subtraia o valor mais antigo da média móvel
+      sum -= adcValues[N - 1];
+      
+      // Desloque os valores existentes na matriz para a direita
+      for (int i = N - 1; i > 0; i--) {
+        adcValues[i] = adcValues[i - 1];
+      }
+      
+      // Adicione o novo valor à média móvel
+      adcValues[0] = adc.value;
+
+      sum += adc.value;
+      int smoothedValue = sum / N;
+
+      // Envie a média móvel para a task_adc
+      xQueueSend(xQueuePROC, &smoothedValue, 0);
+    }
+  }
+}
+
+
+
 static void task_adc(void *pvParameters) {
 
   // configura ADC e TC para controlar a leitura
@@ -123,13 +180,13 @@ static void task_adc(void *pvParameters) {
   // variável para recever dados da fila
   adcData adc;
 
-  while (1) {
-    if (xQueueReceive(xQueueADC, &(adc), 1000)) {
-      printf("ADC: %d \n", adc.value);
-    } else {
-      printf("Nao chegou um novo dado em 1 segundo");
+  for (;;) {
+    // espera por dado na fila
+    if (xQueueReceive(xQueuePROC, &adc, portMAX_DELAY) == pdTRUE) {
+      printf("recebe: %d\n", adc.value);
     }
   }
+  
 }
 
 /************************************************************************/
@@ -158,7 +215,7 @@ static void config_AFEC_pot(Afec *afec, uint32_t afec_id, uint32_t afec_channel,
                             afec_callback_t callback) {
   /*************************************
    * Ativa e configura AFEC
-   *************************************/
+   ***********************************/
   /* Ativa AFEC - 0 */
   afec_enable(afec);
 
@@ -174,7 +231,7 @@ static void config_AFEC_pot(Afec *afec, uint32_t afec_id, uint32_t afec_channel,
   /* Configura trigger por software */
   afec_set_trigger(afec, AFEC_TRIG_SW);
 
-  /*** Configuracao específica do canal AFEC ***/
+  /*** Configuracao específica do canal AFEC */
   struct afec_ch_config afec_ch_cfg;
   afec_ch_get_config_defaults(&afec_ch_cfg);
   afec_ch_cfg.gain = AFEC_GAINVALUE_0;
@@ -187,7 +244,7 @@ static void config_AFEC_pot(Afec *afec, uint32_t afec_id, uint32_t afec_channel,
   */
   afec_channel_set_analog_offset(afec, afec_channel, 0x200);
 
-  /***  Configura sensor de temperatura ***/
+  /***  Configura sensor de temperatura */
   struct afec_temp_sensor_config afec_temp_sensor_cfg;
 
   afec_temp_sensor_get_config_defaults(&afec_temp_sensor_cfg);
@@ -217,10 +274,23 @@ int main(void) {
   if (xQueueADC == NULL)
     printf("falha em criar a queue xQueueADC \n");
 
+  xQueuePROC = xQueueCreate(100, sizeof(adcData));
+  if (xQueuePROC == NULL)
+    printf("falha em criar a queue xQueuePROC \n");
+
   if (xTaskCreate(task_adc, "ADC", TASK_ADC_STACK_SIZE, NULL,
                   TASK_ADC_STACK_PRIORITY, NULL) != pdPASS) {
     printf("Failed to create test ADC task\r\n");
   }
+
+  if (xTaskCreate(task_proc, "PROC", TASK_PROC_STACK_SIZE, NULL,
+                  TASK_ADC_STACK_PRIORITY, NULL) != pdPASS) {
+    printf("Failed to create test PROC task\r\n");
+  }
+
+  // Cria semáforo
+  xSemaphore = xSemaphoreCreateBinary();
+  
 
   vTaskStartScheduler();
 
